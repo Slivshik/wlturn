@@ -16,6 +16,8 @@ WG_PORT=${WG_PORT:-51820}
 read -p "Порт TURN-прокси [56000]: " TURN_PORT
 TURN_PORT=${TURN_PORT:-56000}
 
+EXT_IF=$(ip route | grep default | awk '{print $5}')
+
 echo -e "${YELLOW}Начинаю установку...${NC}"
 
 # Обновление и установка пакетов
