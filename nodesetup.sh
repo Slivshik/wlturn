@@ -33,8 +33,6 @@ cat > wg0.conf <<EOF
 PrivateKey = $(cat server_private)
 Address = 10.0.0.1/13
 ListenPort = $WG_PORT
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $EXT_IF -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o $EXT_IF -j MASQUERADE
 EOF
 
 # IP-форвардинг
