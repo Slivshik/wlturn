@@ -22,7 +22,7 @@ echo -e "${YELLOW}Начинаю установку...${NC}"
 
 # Обновление и установка пакетов
 apt update && apt upgrade -y
-apt install wireguard iptables-persistent net-tools curl -y
+apt install wireguard net-tools curl -y
 
 # WireGuard
 cd /etc/wireguard
@@ -34,10 +34,6 @@ PrivateKey = $(cat server_private)
 Address = 10.0.0.1/13
 ListenPort = $WG_PORT
 EOF
-
-# IP-форвардинг
-sysctl -w net.ipv4.ip_forward=1
-echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
 # Запуск WireGuard
 systemctl enable wg-quick@wg0
