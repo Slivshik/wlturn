@@ -1,81 +1,127 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Цвета для вывода
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# ------------------------------------------------------------------------------
+# Функция повторных попыток для команд
+# ------------------------------------------------------------------------------
+retry() {
+    local max_attempts=5
+    local delay=5
+    local attempt=1
+    local cmd="$*"
+    until $cmd; do
+        if (( attempt >= max_attempts )); then
+            echo -e "${RED}Команда '$cmd' не удалась после $max_attempts попыток.${NC}"
+            return 1
+        fi
+        echo -e "${YELLOW}Попытка $attempt не удалась. Повтор через ${delay}с...${NC}"
+        sleep $delay
+        ((attempt++))
+    done
+}
+
+# Проверка root
 if [[ "${EUID}" -ne 0 ]]; then
     echo -e "${RED}Запустите скрипт от root (sudo).${NC}"
     exit 1
 fi
 
-echo -e "${GREEN}=== Установка VPN-ноды (WireGuard + TURN + API) ===${NC}"
+echo -e "${GREEN}=== Установка VPN-ноды (WireGuard + TURN + API) v2 ===${NC}"
 
-# ---------------------------------------------------------------------------
-# Сбор параметров
-# ---------------------------------------------------------------------------
-read -r -p "Имя ноды (например, RU-1): " NODE_NAME
-read -r -p "Пароль для SSH (для экстренного доступа, если API откажет): " SSH_PASSWORD
-read -r -p "Порт WireGuard [51820]: " WG_PORT
-WG_PORT="${WG_PORT:-51820}"
-read -r -p "Порт TURN прокси [56000]: " TURN_PORT
-TURN_PORT="${TURN_PORT:-56000}"
-read -r -p "Порт API [8787]: " API_PORT
-API_PORT="${API_PORT:-8787}"
-read -r -p "Хост для привязки API [0.0.0.0]: " API_HOST
-API_HOST="${API_HOST:-0.0.0.0}"
-read -r -p "API токен (оставьте пустым для авто-генерации): " API_TOKEN
-if [[ -z "${API_TOKEN}" ]]; then
-    API_TOKEN="$(openssl rand -hex 32)"
-    echo -e "${YELLOW}Сгенерирован токен: ${API_TOKEN}${NC}"
+# ------------------------------------------------------------------------------
+# Сбор параметров (если уже запускали, можно пропустить ввод)
+# ------------------------------------------------------------------------------
+if [[ -f /etc/vpn-node.env ]]; then
+    source /etc/vpn-node.env
+    echo -e "${YELLOW}Найдена конфигурация предыдущей установки.${NC}"
+    echo "Имя ноды: $NODE_NAME"
+    echo "Пароль SSH: (скрыт)"
+    echo "Порт WG: $WG_PORT"
+    echo "Порт TURN: $TURN_PORT"
+    echo "Порт API: $API_PORT"
+    read -r -p "Использовать эти настройки? [Y/n]: " USE_EXISTING
+    USE_EXISTING="${USE_EXISTING:-Y}"
+    if [[ "$USE_EXISTING" =~ ^[Yy]$ ]]; then
+        SSH_PASSWORD="${SSH_PASSWORD:-}"  # уже есть
+    else
+        unset NODE_NAME SSH_PASSWORD WG_PORT TURN_PORT API_PORT API_HOST API_TOKEN
+    fi
 fi
 
-# Определяем внешний интерфейс
+if [[ -z "${NODE_NAME:-}" ]]; then
+    read -r -p "Имя ноды (например, RU-1): " NODE_NAME
+fi
+if [[ -z "${SSH_PASSWORD:-}" ]]; then
+    read -r -p "Пароль для SSH (экстренный доступ): " SSH_PASSWORD
+fi
+WG_PORT="${WG_PORT:-51820}"
+TURN_PORT="${TURN_PORT:-56000}"
+API_PORT="${API_PORT:-8787}"
+API_HOST="${API_HOST:-0.0.0.0}"
+
+if [[ -z "${API_TOKEN:-}" ]]; then
+    read -r -p "API токен (пусто = автогенерация): " API_TOKEN
+    if [[ -z "${API_TOKEN}" ]]; then
+        API_TOKEN="$(openssl rand -hex 32)"
+        echo -e "${YELLOW}Сгенерирован токен: ${API_TOKEN}${NC}"
+    fi
+fi
+
+# Сохраняем параметры для возможного перезапуска
+cat > /etc/vpn-node.env <<EOF
+NODE_NAME="${NODE_NAME}"
+SSH_PASSWORD="${SSH_PASSWORD}"
+WG_PORT="${WG_PORT}"
+TURN_PORT="${TURN_PORT}"
+API_PORT="${API_PORT}"
+API_HOST="${API_HOST}"
+API_TOKEN="${API_TOKEN}"
+EOF
+chmod 600 /etc/vpn-node.env
+
 EXT_IF=$(ip route | grep default | awk '{print $5}')
 echo -e "${YELLOW}Внешний интерфейс: $EXT_IF${NC}"
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # 1. Установка системных пакетов
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 echo -e "${YELLOW}[1/7] Установка пакетов...${NC}"
 apt update -y
 apt upgrade -y
 apt install -y wireguard net-tools curl iptables-persistent \
                python3 python3-venv python3-pip
 
-# ---------------------------------------------------------------------------
-# 2. Базовая защита SSH (на случай сбоя iptables)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 2. Базовая защита SSH
+# ------------------------------------------------------------------------------
 echo -e "${YELLOW}[2/7] Резервирование SSH-доступа...${NC}"
 iptables -I INPUT -p tcp --dport 22 -j ACCEPT
 netfilter-persistent save
 
-# ---------------------------------------------------------------------------
-# 3. Включение IP-форвардинга
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 3. IP-форвардинг
+# ------------------------------------------------------------------------------
 echo -e "${YELLOW}[3/7] Включение IP forwarding...${NC}"
 sysctl -w net.ipv4.ip_forward=1
-echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-# ---------------------------------------------------------------------------
-# 4. Настройка WireGuard с ПРАВИЛЬНОЙ подсетью 10.0.0.0/13
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 4. WireGuard (если ещё не настроен)
+# ------------------------------------------------------------------------------
 echo -e "${YELLOW}[4/7] Настройка WireGuard...${NC}"
-cd /etc/wireguard
-umask 077
-
-# Генерируем ключи, если ещё нет
-if [[ ! -f server_private ]]; then
+if [[ ! -f /etc/wireguard/wg0.conf ]]; then
+    cd /etc/wireguard
+    umask 077
     wg genkey | tee server_private | wg pubkey > server_public
-fi
-SERVER_PRIVATE=$(cat server_private)
-SERVER_PUBLIC=$(cat server_public)
+    SERVER_PRIVATE=$(cat server_private)
+    SERVER_PUBLIC=$(cat server_public)
 
-# Создаём конфиг wg0.conf с подсетью, совместимой с ботом
-cat > wg0.conf <<EOF
+    cat > wg0.conf <<EOF
 [Interface]
 PrivateKey = ${SERVER_PRIVATE}
 Address = 10.0.0.1/13
@@ -84,34 +130,35 @@ PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${EXT_IF} -j MASQUERADE
 EOF
 
-# Запускаем WireGuard
-systemctl enable wg-quick@wg0
-systemctl restart wg-quick@wg0
-
-# Проверка, что SSH всё ещё слушается (защита от блокировки)
-sleep 5
-if ! ss -tln | grep -q ":22 "; then
-    echo -e "${RED}ОШИБКА: SSH порт 22 перестал слушаться! Откат WireGuard...${NC}"
-    systemctl stop wg-quick@wg0
-    systemctl disable wg-quick@wg0
-    iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -o ${EXT_IF} -j MASQUERADE 2>/dev/null || true
-    netfilter-persistent save
-    echo -e "${RED}Откат выполнен. Проверьте конфигурацию сети вручную.${NC}"
-    exit 1
+    systemctl enable wg-quick@wg0
+    systemctl restart wg-quick@wg0
+    sleep 5
+    if ! ss -tln | grep -q ":22 "; then
+        echo -e "${RED}ОШИБКА: SSH порт 22 пропал! Откат...${NC}"
+        systemctl stop wg-quick@wg0
+        systemctl disable wg-quick@wg0
+        iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
+        iptables -t nat -D POSTROUTING -o ${EXT_IF} -j MASQUERADE 2>/dev/null || true
+        netfilter-persistent save
+        exit 1
+    fi
+else
+    echo -e "${YELLOW}WireGuard уже настроен, пропускаем.${NC}"
+    SERVER_PUBLIC=$(cat /etc/wireguard/server_public)
 fi
 
-# ---------------------------------------------------------------------------
-# 5. Установка TURN-прокси (vk-turn-proxy)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 5. TURN-прокси (vk-turn-proxy)
+# ------------------------------------------------------------------------------
 echo -e "${YELLOW}[5/7] Установка TURN прокси...${NC}"
-cd /opt
-if [[ ! -f vk-turn-proxy ]]; then
-    wget -q -O vk-turn-proxy https://github.com/kiper292/vk-turn-proxy/releases/download/v2.0.2/server-linux-amd64
-    chmod +x vk-turn-proxy
+if [[ ! -f /opt/vk-turn-proxy ]]; then
+    echo "Загрузка vk-turn-proxy v2.0.7..."
+    retry wget -q -O /opt/vk-turn-proxy https://github.com/kiper292/vk-turn-proxy/releases/download/v2.0.7/server-linux-amd64
+    chmod +x /opt/vk-turn-proxy
 fi
 
-cat > /etc/systemd/system/vk-turn-proxy.service <<EOF
+if [[ ! -f /etc/systemd/system/vk-turn-proxy.service ]]; then
+    cat > /etc/systemd/system/vk-turn-proxy.service <<EOF
 [Unit]
 Description=VK Turn Proxy
 After=network.target wg-quick@wg0.service
@@ -126,33 +173,37 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
-
-systemctl daemon-reload
-systemctl enable vk-turn-proxy
+    systemctl daemon-reload
+    systemctl enable vk-turn-proxy
+fi
 systemctl restart vk-turn-proxy
 
-# ---------------------------------------------------------------------------
-# 6. Установка Node API (управление без SSH)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 6. Node API (с повторами при установке pip)
+# ------------------------------------------------------------------------------
 echo -e "${YELLOW}[6/7] Установка Node API...${NC}"
 
-# Создаём системного пользователя
-id -u vpnnodeapi >/dev/null 2>&1 || useradd --system --home /opt/vpn-node-api --shell /usr/sbin/nologin vpnnodeapi
-
+id -u vpnnodeapi &>/dev/null || useradd --system --home /opt/vpn-node-api --shell /usr/sbin/nologin vpnnodeapi
 mkdir -p /opt/vpn-node-api
 cd /opt/vpn-node-api
 
-# Python зависимости
+# requirements.txt
 cat > requirements.txt <<'REQ'
 fastapi==0.115.6
 uvicorn==0.32.1
 REQ
 
-python3 -m venv .venv
-.venv/bin/pip install --upgrade pip >/dev/null
-.venv/bin/pip install -r requirements.txt >/dev/null
+# Виртуальное окружение (если ещё нет)
+if [[ ! -d .venv ]]; then
+    python3 -m venv .venv
+fi
 
-# Код API (тот же, что был предоставлен)
+# Установка pip с повторными попытками
+echo "Установка Python-зависимостей (с повторами)..."
+retry .venv/bin/pip install --upgrade pip
+retry .venv/bin/pip install -r requirements.txt
+
+# Код API
 cat > app.py <<'PY'
 import asyncio
 import os
@@ -306,7 +357,7 @@ def restart_service(payload: RestartReq, x_api_token: str | None = Header(defaul
     return {"ok": True, "service": payload.service}
 PY
 
-# Файл окружения для API
+# Файл окружения
 cat > /etc/vpn-node-api.env <<EOF
 VPN_NODE_API_TOKEN=${API_TOKEN}
 WG_PORT=${WG_PORT}
@@ -316,7 +367,7 @@ CMD_TIMEOUT=12
 EOF
 chmod 600 /etc/vpn-node-api.env
 
-# Systemd-сервис для API
+# Systemd unit
 cat > /etc/systemd/system/vpn-node-api.service <<EOF
 [Unit]
 Description=VPN Node API
@@ -347,15 +398,15 @@ if ! systemctl is-active --quiet vpn-node-api; then
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# 7. Сохраняем правила iptables
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 7. Сохранение правил iptables
+# ------------------------------------------------------------------------------
 echo -e "${YELLOW}[7/7] Сохранение правил iptables...${NC}"
 netfilter-persistent save
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Итоговая информация
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 PUB_IP="$(curl -fsS ifconfig.me || echo "Не удалось определить")"
 
 echo -e "${GREEN}=====================================${NC}"
@@ -369,7 +420,7 @@ echo -e "API токен:       ${YELLOW}${API_TOKEN}${NC}"
 echo -e "${GREEN}=====================================${NC}"
 echo ""
 echo -e "🔐 Сохраните токен в надёжном месте!"
-echo -e "Для добавления ноды в бота используйте переменные окружения:"
+echo -e "Для добавления ноды в бота:"
 echo -e "  ${YELLOW}API_URL_${NODE_NAME^^}=http://${PUB_IP}:${API_PORT}${NC}"
 echo -e "  ${YELLOW}API_TOKEN_${NODE_NAME^^}=${API_TOKEN}${NC}"
 echo -e "  ${YELLOW}API_ONLY=1${NC}  (рекомендуется)"
