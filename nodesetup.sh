@@ -82,8 +82,9 @@ VPN_SERVER_IP="$(echo "$VPN_SUBNET" | cut -d/ -f1 | awk -F. '{print $1"."$2"."$3
 echo -e "${GREEN}Выбрана подсеть: ${VPN_SUBNET} (сервер: ${VPN_SERVER_IP})${NC}"
 
 # ------------------------------------------------------------------------------
-# Сбор параметров
+# Сбор параметров (читаем явно с терминала)
 # ------------------------------------------------------------------------------
+exec </dev/tty
 read -r -p "Имя ноды: " NODE_NAME
 read -r -p "Пароль SSH (для экстренного доступа): " SSH_PASSWORD
 WG_PORT="${WG_PORT:-51820}"
@@ -92,6 +93,7 @@ API_PORT="${API_PORT:-8787}"
 API_HOST="${API_HOST:-0.0.0.0}"
 read -r -p "API токен (пусто = автогенерация): " API_TOKEN
 API_TOKEN="${API_TOKEN:-$(openssl rand -hex 32)}"
+exec <&-
 
 # Сохраняем параметры (включая выбранную подсеть)
 cat > /etc/vpn-node.env <<EOF
