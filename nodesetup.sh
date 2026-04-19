@@ -6,6 +6,10 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# 🔧 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ #1: Установка зависимостей ДО их использования
+apt update -y
+apt install -y ipcalc wireguard net-tools curl iptables-persistent python3-venv python3-pip
+
 # Проверка root
 if [[ "${EUID}" -ne 0 ]]; then
     echo -e "${RED}Запустите от root${NC}"
@@ -33,8 +37,8 @@ retry() {
 get_used_subnets() {
     ip -4 addr show | grep -oP 'inet \K[\d.]+/\d+' | while read cidr; do
         # Приводим к сети /24 или более крупной для сравнения
-        ipcalc -n "$cidr" | grep Network | awk '{print $2}'
-    done 2>/dev/null | sort -u
+        ipcalc -n "$cidr" 2>/dev/null | grep Network | awk '{print $2}'
+    done 2>/dev/null | sort -u || true
 }
 
 # ------------------------------------------------------------------------------
@@ -46,22 +50,21 @@ CANDIDATES=(
     "192.168.255.0/24"
 )
 
-USED=$(get_used_subnets)
+# 🔧 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ #2: Защита от преждевременного завершения
+USED=$(get_used_subnets || true)
 echo -e "${YELLOW}Занятые подсети:${NC}"
-echo "$USED"
+echo "${USED:-[нет данных]}"
 
 SELECTED=""
 for subnet in "${CANDIDATES[@]}"; do
     conflict=0
+    subnet_base=$(echo "$subnet" | cut -d/ -f1)
+    subnet_mask=$(echo "$subnet" | cut -d/ -f2)
+    
     for used in $USED; do
-        # Простейшая проверка пересечения (можно заменить на ipcalc если установлен)
-        if ip route get "$(echo "$subnet" | cut -d/ -f1).1" | grep -q "dev"; then
-            :  # не идеально, но для простоты
-        fi
-        # Более надёжно: смотрим не входит ли подсеть кандидата в занятые
-        subnet_net=$(echo "$subnet" | cut -d/ -f1)
-        used_net=$(echo "$used" | cut -d/ -f1)
-        if [[ "$subnet_net" == "$used_net"* ]] || [[ "$used_net" == "$subnet_net"* ]]; then
+        [[ -z "$used" ]] && continue
+        # Простая проверка: если кандидат начинается с той же сети — конфликт
+        if [[ "$subnet_base" == "$used"* ]] || [[ "$used" == "$subnet_base"* ]]; then
             conflict=1
             break
         fi
@@ -113,10 +116,9 @@ EXT_IF=$(ip route | grep default | awk '{print $5}')
 echo -e "${YELLOW}Внешний интерфейс: $EXT_IF${NC}"
 
 # ------------------------------------------------------------------------------
-# 1. Пакеты
+# 1. Пакеты (дополнительно, если что-то не установилось выше)
 # ------------------------------------------------------------------------------
-echo -e "${YELLOW}[1/7] Установка пакетов...${NC}"
-apt update -y
+echo -e "${YELLOW}[1/7] Проверка пакетов...${NC}"
 apt install -y wireguard net-tools curl iptables-persistent python3-venv python3-pip ipcalc
 
 # ------------------------------------------------------------------------------
@@ -166,9 +168,9 @@ cat > /etc/wireguard/scripts/iptables-down.sh <<'SCRIPT'
 #!/bin/bash
 source /etc/vpn-node.env
 EXT_IF=$(ip route | grep default | awk '{print $5}')
-iptables -D FORWARD -i wg0 -j ACCEPT
-iptables -D FORWARD -o wg0 -j ACCEPT
-iptables -t nat -D POSTROUTING -s ${VPN_SUBNET} -o $EXT_IF -j MASQUERADE
+iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
+iptables -t nat -D POSTROUTING -s ${VPN_SUBNET} -o $EXT_IF -j MASQUERADE 2>/dev/null || true
 SCRIPT
 
 chmod +x /etc/wireguard/scripts/*.sh
@@ -399,7 +401,11 @@ if ! curl -s --max-time 5 ifconfig.me > /dev/null; then
     echo -e "${RED}ОШИБКА: Сеть пропала после запуска WireGuard! Откат...${NC}"
     systemctl stop wg-quick@wg0
     iptables -F; iptables -t nat -F
-    iptables-restore < /root/iptables.backup.* 2>/dev/null || true
+    # 🔧 ИСПРАВЛЕНИЕ #4: Корректное восстановление бэкапа
+    BACKUP_FILE=$(ls -t /root/iptables.backup.* 2>/dev/null | head -n1)
+    if [[ -n "$BACKUP_FILE" ]]; then
+        iptables-restore < "$BACKUP_FILE" 2>/dev/null || true
+    fi
     exit 1
 fi
 
