@@ -621,7 +621,7 @@ CMD_TIMEOUT = int(os.getenv("CMD_TIMEOUT", "10"))
 ALLOW_KEYPAIR_API = os.getenv("ALLOW_KEYPAIR_API", "0") == "1"
 WDTT_TURN_PORT = int(os.getenv("WDTT_TURN_PORT", "$WDTT_DTLS_PORT"))
 VK_TURN_PORT   = int(os.getenv("VK_TURN_PORT", "$VK_TURN_PORT"))
-WDTT_SECRET_PATH = Path(os.getenv("WDTT_SECRET_PATH", "/var/lib/vpn-node-api/wdtt-secrets.json"))
+WDTT_SECRET_PATH = Path(os.getenv("WDTT_SECRET_PATH", "/etc/wireguard/wdtt/passwords.json"))
 
 app = FastAPI(title="vpn-node-api", version="2.0.0")
 wg_lock = asyncio.Lock()
@@ -653,10 +653,22 @@ def _check_auth(token):
 def _load_wdtt_secrets():
     try:
         if not WDTT_SECRET_PATH.exists():
-            return {}
-        return json.loads(WDTT_SECRET_PATH.read_text(encoding="utf-8"))
+            return {"main_password": "", "admin_id": "", "bot_token": "", "passwords": {}, "devices": {}}
+        data = json.loads(WDTT_SECRET_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("main_password", "")
+        data.setdefault("admin_id", "")
+        data.setdefault("bot_token", "")
+        data.setdefault("passwords", {})
+        data.setdefault("devices", {})
+        if not isinstance(data["passwords"], dict):
+            data["passwords"] = {}
+        if not isinstance(data["devices"], dict):
+            data["devices"] = {}
+        return data
     except Exception:
-        return {}
+        return {"main_password": "", "admin_id": "", "bot_token": "", "passwords": {}, "devices": {}}
 
 def _save_wdtt_secrets(data: dict):
     WDTT_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -784,18 +796,23 @@ class WDTTSecretReq(BaseModel):
 def wdtt_secret(payload: WDTTSecretReq, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     data = _load_wdtt_secrets()
-    key = str(payload.peer_id)
-    cur = data.get(key)
-    if cur and isinstance(cur, dict) and cur.get("secret"):
-        return {"ok": True, "peer_id": payload.peer_id, "secret": cur["secret"], "reused": True}
-    secret = secrets.token_urlsafe(18)
-    data[key] = {
-        "uid": payload.uid,
-        "peer_id": payload.peer_id,
+    pw = data.get("passwords", {})
+    # Reuse existing secret for this peer_id if present
+    for sec, meta in pw.items():
+        if isinstance(meta, dict) and int(meta.get("peer_id", 0) or 0) == int(payload.peer_id):
+            return {"ok": True, "peer_id": payload.peer_id, "secret": sec, "reused": True}
+    secret = secrets.token_urlsafe(12)
+    pw[secret] = {
+        "device_id": "",
+        "expires_at": 0,
+        "down_bytes": 0,
+        "up_bytes": 0,
+        "uid": int(payload.uid),
+        "peer_id": int(payload.peer_id),
         "public_key": payload.public_key,
-        "secret": secret,
         "created_at": int(time.time()),
     }
+    data["passwords"] = pw
     _save_wdtt_secrets(data)
     return {"ok": True, "peer_id": payload.peer_id, "secret": secret, "reused": False}
 
@@ -807,10 +824,30 @@ def wdtt_secret_generate(payload: WDTTSecretReq, x_api_token: str | None = Heade
 def wdtt_secret_get(peer_id: int, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     data = _load_wdtt_secrets()
-    cur = data.get(str(peer_id))
-    if not cur:
-        raise HTTPException(404, "Secret not found")
-    return {"ok": True, "peer_id": peer_id, "secret": cur.get("secret", "")}
+    for sec, meta in data.get("passwords", {}).items():
+        if isinstance(meta, dict) and int(meta.get("peer_id", 0) or 0) == int(peer_id):
+            return {"ok": True, "peer_id": peer_id, "secret": sec}
+    raise HTTPException(404, "Secret not found")
+
+class WDTTSecretDeleteReq(BaseModel):
+    peer_id: int
+
+@app.post("/wdtt/secret/delete")
+def wdtt_secret_delete(payload: WDTTSecretDeleteReq, x_api_token: str | None = Header(default=None)):
+    _check_auth(x_api_token)
+    data = _load_wdtt_secrets()
+    pw = data.get("passwords", {})
+    victim = None
+    for sec, meta in pw.items():
+        if isinstance(meta, dict) and int(meta.get("peer_id", 0) or 0) == int(payload.peer_id):
+            victim = sec
+            break
+    if not victim:
+        return {"ok": True, "deleted": False}
+    pw.pop(victim, None)
+    data["passwords"] = pw
+    _save_wdtt_secrets(data)
+    return {"ok": True, "deleted": True}
 
 @app.get("/wdtt/runtime-password")
 def wdtt_runtime_password(x_api_token: str | None = Header(default=None)):
@@ -847,7 +884,7 @@ CMD_TIMEOUT=12
 ALLOW_KEYPAIR_API=0
 WDTT_TURN_PORT=${WDTT_DTLS_PORT}
 VK_TURN_PORT=${VK_TURN_PORT}
-WDTT_SECRET_PATH=/var/lib/vpn-node-api/wdtt-secrets.json
+WDTT_SECRET_PATH=/etc/wireguard/wdtt/passwords.json
 EOF
     chmod 600 /etc/vpn-node-api.env
 
