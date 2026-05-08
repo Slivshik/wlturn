@@ -676,6 +676,13 @@ def _save_wdtt_secrets(data: dict):
     tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     tmp.replace(WDTT_SECRET_PATH)
 
+_PASS_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+
+def _gen_compat_secret(length: int = 7) -> str:
+    # Compatible with old server.go generatePassword(): no 0/O/1/l and no symbols.
+    alphabet = _PASS_CHARS
+    return "".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(length))
+
 @app.get("/health")
 def health(x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
@@ -801,7 +808,7 @@ def wdtt_secret(payload: WDTTSecretReq, x_api_token: str | None = Header(default
     for sec, meta in pw.items():
         if isinstance(meta, dict) and int(meta.get("peer_id", 0) or 0) == int(payload.peer_id):
             return {"ok": True, "peer_id": payload.peer_id, "secret": sec, "reused": True}
-    secret = secrets.token_urlsafe(12)
+    secret = _gen_compat_secret(7)
     pw[secret] = {
         "device_id": "",
         "expires_at": 0,
