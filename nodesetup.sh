@@ -39,6 +39,7 @@ API_HOST="${API_HOST:-0.0.0.0}"
 WDTT_DTLS_PORT=56000
 WDTT_WG_PORT=56001
 WDTT_BINARY_URL="${WDTT_BINARY_URL:-}"   # задаётся приложением при деплое
+WDTT_PASSWORD="${WDTT_PASSWORD:-ff}"
 
 # VK-специфичные
 VK_TURN_PORT=56010
@@ -154,6 +155,14 @@ parse_args() {
     if [[ -z "$API_TOKEN" ]]; then
         API_TOKEN=$(openssl rand -hex 32)
         log_info "API токен сгенерирован автоматически"
+    fi
+}
+
+normalize_ports() {
+    # В dual WDTT и VK не должны делить один UDP порт.
+    if [[ "${INSTALL_MODE:-}" == "dual" && "${WDTT_DTLS_PORT}" == "${VK_TURN_PORT}" ]]; then
+        log_warn "Конфликт портов в dual: WDTT_DTLS_PORT=${WDTT_DTLS_PORT} == VK_TURN_PORT=${VK_TURN_PORT}. Переношу VK_TURN_PORT на 56010."
+        VK_TURN_PORT=56010
     fi
 }
 
@@ -411,7 +420,6 @@ setup_nat() {
 
     if [[ "$INSTALL_MODE" == "wdtt" || "$INSTALL_MODE" == "dual" ]]; then
         fw_add_input_udp "$WDTT_DTLS_PORT"
-        fw_add_input_udp "$WDTT_WG_PORT"
         # WDTT использует весь UDP диапазон для TURN relay
         case "$FW_BACKEND" in
             iptables) iptables -C INPUT -p udp --dport 1024:65535 -j ACCEPT 2>/dev/null || \
@@ -466,22 +474,27 @@ install_wdtt_server() {
 # ─── РЕЖИМ WDTT: systemd-сервис ──────────────────────────────────────────────
 setup_wdtt_service() {
     log_step "Создание systemd-сервиса wdtt..."
-    local wdtt_cfg_dir="/etc/wireguard"
-    if [[ "$INSTALL_MODE" == "dual" ]]; then
-        wdtt_cfg_dir="/etc/wireguard/wdtt"
-        mkdir -p "$wdtt_cfg_dir"
-    fi
+    mkdir -p /etc/wireguard/wdtt
+    cat > /usr/local/bin/wdtt-firewall.sh <<EOF
+#!/usr/bin/env bash
+set -e
+if command -v iptables >/dev/null 2>&1; then
+  iptables -C INPUT -p udp --dport ${WDTT_DTLS_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WDTT_DTLS_PORT} -j ACCEPT
+fi
+exit 0
+EOF
+    chmod +x /usr/local/bin/wdtt-firewall.sh
 
     cat > /etc/systemd/system/wdtt.service <<EOF
 [Unit]
-Description=WDTT VPN Server (DTLS+WireGuard)
+Description=WDTT SOCKS5 KCP smux Server
 After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=-/usr/bin/env bash -c "fuser -k -9 ${WDTT_DTLS_PORT}/udp ${WDTT_WG_PORT}/udp 2>/dev/null || true"
-ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${WDTT_DTLS_PORT} -wg-port ${WDTT_WG_PORT} -config-dir ${wdtt_cfg_dir}
+ExecStartPre=/usr/local/bin/wdtt-firewall.sh
+ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${WDTT_DTLS_PORT} -transport kcp
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -856,6 +869,23 @@ def wdtt_secret_delete(payload: WDTTSecretDeleteReq, x_api_token: str | None = H
     _save_wdtt_secrets(data)
     return {"ok": True, "deleted": True}
 
+@app.get("/wdtt/stats")
+def wdtt_stats(x_api_token: str | None = Header(default=None)):
+    _check_auth(x_api_token)
+    data = _load_wdtt_secrets()
+    pw = data.get("passwords", {}) if isinstance(data, dict) else {}
+    secrets_n = 0
+    devices_n = 0
+    total_bytes = 0
+    for _, meta in (pw.items() if isinstance(pw, dict) else []):
+        if not isinstance(meta, dict):
+            continue
+        secrets_n += 1
+        if str(meta.get("device_id", "")).strip():
+            devices_n += 1
+        total_bytes += int(meta.get("down_bytes", 0) or 0) + int(meta.get("up_bytes", 0) or 0)
+    return {"ok": True, "secrets": secrets_n, "devices_bound": devices_n, "total_bytes": total_bytes}
+
 @app.get("/wdtt/runtime-password")
 def wdtt_runtime_password(x_api_token: str | None = Header(default=None)):
     """
@@ -1033,7 +1063,7 @@ print_summary() {
         fi
     elif [[ "$INSTALL_MODE" == "dual" ]]; then
         echo -e "  VK TURN порт:${YELLOW}${VK_TURN_PORT}${NC}  (wg0:${VK_WG_PORT})"
-        echo -e "  WDTT DTLS:   ${YELLOW}${WDTT_DTLS_PORT}${NC}  (WG:${WDTT_WG_PORT})"
+        echo -e "  WDTT порт:   ${YELLOW}${WDTT_DTLS_PORT}${NC}  (KCP/SOCKS)"
         [[ "${HY2_ENABLE}" == "1" ]] && echo -e "  HY2 порт:     ${YELLOW}${HY2_PORT}${NC}"
         echo -e "  Режим:       ${YELLOW}dual${NC} (старые VK конфиги сохраняются)"
     else
@@ -1253,11 +1283,13 @@ main() {
         if [[ "$upgrade_cmd" == "--upgrade-dual" && -z "${INSTALL_MODE:-}" ]]; then
             INSTALL_MODE="dual"
         fi
+        normalize_ports
         upgrade_existing_node
         return 0
     fi
 
     parse_args "$@"
+    normalize_ports
     detect_os
     detect_firewall
     auto_select_subnet
