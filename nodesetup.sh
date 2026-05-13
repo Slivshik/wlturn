@@ -662,6 +662,17 @@ def _run_input(cmd, stdin_data, timeout=CMD_TIMEOUT):
         raise RuntimeError(f"{' '.join(cmd)} failed: {err[:300]}")
     return (proc.stdout or "").strip()
 
+def _wg_iface():
+    try:
+        ifaces = _run(["wg", "show", "interfaces"]).split()
+        if "wg0" in ifaces:
+            return "wg0"
+        if "wdtt0" in ifaces:
+            return "wdtt0"
+        return ifaces[0] if ifaces else "wg0"
+    except Exception:
+        return "wg0"
+
 def _check_auth(token):
     if not API_TOKEN or token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -705,7 +716,8 @@ def health(x_api_token: str | None = Header(default=None)):
     wg_if = False
     try:
         ifaces = _run(["wg", "show", "interfaces"])
-        wg_if = "wg0" in ifaces.split()
+        xs = ifaces.split()
+        wg_if = ("wg0" in xs) or ("wdtt0" in xs)
     except: pass
     out = ""
     try:
@@ -734,7 +746,7 @@ def health(x_api_token: str | None = Header(default=None)):
 def info(x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     pub = ""
-    try: pub = _run(["wg", "show", "wg0", "public-key"]).strip()
+    try: pub = _run(["wg", "show", _wg_iface(), "public-key"]).strip()
     except: pass
     return {"node": NODE_NAME, "mode": NODE_MODE, "vpn_subnet": VPN_SUBNET,
             "public_key": pub}
@@ -742,7 +754,7 @@ def info(x_api_token: str | None = Header(default=None)):
 @app.get("/wg/public-key")
 def wg_public_key(x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
-    return {"public_key": _run(["wg", "show", "wg0", "public-key"]).strip()}
+    return {"public_key": _run(["wg", "show", _wg_iface(), "public-key"]).strip()}
 
 @app.post("/wg/keypair")
 def wg_keypair(x_api_token: str | None = Header(default=None)):
@@ -756,7 +768,7 @@ def wg_keypair(x_api_token: str | None = Header(default=None)):
 @app.get("/wg/transfer")
 def wg_transfer(x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
-    out = _run(["wg", "show", "wg0", "transfer"])
+    out = _run(["wg", "show", _wg_iface(), "transfer"])
     data = []
     for line in out.splitlines():
         parts = line.split()
@@ -768,7 +780,7 @@ def wg_transfer(x_api_token: str | None = Header(default=None)):
 @app.get("/wg/latest-handshakes")
 def latest_handshakes(x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
-    out = _run(["wg", "show", "wg0", "latest-handshakes"])
+    out = _run(["wg", "show", _wg_iface(), "latest-handshakes"])
     data = []
     for line in out.splitlines():
         parts = line.split()
@@ -785,7 +797,7 @@ class PeerUpsert(BaseModel):
 async def wg_peer_upsert(payload: PeerUpsert, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     async with wg_lock:
-        _run(["wg", "set", "wg0", "peer", payload.public_key, "allowed-ips", f"{payload.ip}/32"])
+        _run(["wg", "set", _wg_iface(), "peer", payload.public_key, "allowed-ips", f"{payload.ip}/32"])
     return {"ok": True}
 
 class PeerRemove(BaseModel):
@@ -795,7 +807,7 @@ class PeerRemove(BaseModel):
 async def wg_peer_remove(payload: PeerRemove, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     async with wg_lock:
-        _run(["wg", "set", "wg0", "peer", payload.public_key, "remove"])
+        _run(["wg", "set", _wg_iface(), "peer", payload.public_key, "remove"])
     return {"ok": True}
 
 class RestartReq(BaseModel):
