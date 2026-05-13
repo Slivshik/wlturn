@@ -420,6 +420,7 @@ setup_nat() {
 
     if [[ "$INSTALL_MODE" == "wdtt" || "$INSTALL_MODE" == "dual" ]]; then
         fw_add_input_udp "$WDTT_DTLS_PORT"
+        fw_add_input_udp "$WDTT_WG_PORT"
         # WDTT использует весь UDP диапазон для TURN relay
         case "$FW_BACKEND" in
             iptables) iptables -C INPUT -p udp --dport 1024:65535 -j ACCEPT 2>/dev/null || \
@@ -474,12 +475,14 @@ install_wdtt_server() {
 # ─── РЕЖИМ WDTT: systemd-сервис ──────────────────────────────────────────────
 setup_wdtt_service() {
     log_step "Создание systemd-сервиса wdtt..."
-    mkdir -p /etc/wireguard/wdtt
+    local wdtt_cfg_dir="/etc/wdtt"
+    mkdir -p "$wdtt_cfg_dir"
     cat > /usr/local/bin/wdtt-firewall.sh <<EOF
 #!/usr/bin/env bash
 set -e
 if command -v iptables >/dev/null 2>&1; then
   iptables -C INPUT -p udp --dport ${WDTT_DTLS_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WDTT_DTLS_PORT} -j ACCEPT
+  iptables -C INPUT -p udp --dport ${WDTT_WG_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WDTT_WG_PORT} -j ACCEPT
 fi
 exit 0
 EOF
@@ -487,14 +490,14 @@ EOF
 
     cat > /etc/systemd/system/wdtt.service <<EOF
 [Unit]
-Description=WDTT SOCKS5 KCP smux Server
+Description=WDTT VPN Server
 After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStartPre=/usr/local/bin/wdtt-firewall.sh
-ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${WDTT_DTLS_PORT} -transport kcp
+ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${WDTT_DTLS_PORT} -wg-port ${WDTT_WG_PORT} -config-dir ${wdtt_cfg_dir} -password "${WDTT_PASSWORD}"
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -537,7 +540,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/vk-turn-proxy -listen 0.0.0.0:56010 -connect 127.0.0.1:${VK_WG_PORT}
+ExecStart=/opt/vk-turn-proxy -listen 0.0.0.0:${VK_TURN_PORT} -connect 127.0.0.1:${VK_WG_PORT}
 Restart=on-failure
 RestartSec=10
 
@@ -633,7 +636,7 @@ VPN_SUBNET  = os.getenv("VPN_SUBNET", "$VPN_SUBNET")
 CMD_TIMEOUT = int(os.getenv("CMD_TIMEOUT", "10"))
 ALLOW_KEYPAIR_API = os.getenv("ALLOW_KEYPAIR_API", "0") == "1"
 WDTT_TURN_PORT = int(os.getenv("WDTT_TURN_PORT", "$WDTT_DTLS_PORT"))
-VK_TURN_PORT   = int(os.getenv("VK_TURN_PORT", "56010"))
+VK_TURN_PORT   = int(os.getenv("VK_TURN_PORT", "$VK_TURN_PORT"))
 WDTT_SECRET_PATH = Path(os.getenv("WDTT_SECRET_PATH", "/etc/wireguard/wdtt/passwords.json"))
 
 app = FastAPI(title="vpn-node-api", version="2.0.0")
