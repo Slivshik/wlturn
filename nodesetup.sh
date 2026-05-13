@@ -637,7 +637,7 @@ CMD_TIMEOUT = int(os.getenv("CMD_TIMEOUT", "10"))
 ALLOW_KEYPAIR_API = os.getenv("ALLOW_KEYPAIR_API", "0") == "1"
 WDTT_TURN_PORT = int(os.getenv("WDTT_TURN_PORT", "$WDTT_DTLS_PORT"))
 VK_TURN_PORT   = int(os.getenv("VK_TURN_PORT", "$VK_TURN_PORT"))
-WDTT_SECRET_PATH = Path(os.getenv("WDTT_SECRET_PATH", "/etc/wireguard/wdtt/passwords.json"))
+WDTT_SECRET_PATH = Path(os.getenv("WDTT_SECRET_PATH", "/etc/wdtt/passwords.json"))
 
 app = FastAPI(title="vpn-node-api", version="2.0.0")
 wg_lock = asyncio.Lock()
@@ -703,10 +703,10 @@ def _save_wdtt_secrets(data: dict):
     tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     tmp.replace(WDTT_SECRET_PATH)
 
-_PASS_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+_PASS_CHARS = "abcdefghjkmnpqrstuvwxyz23456789"
 
-def _gen_compat_secret(length: int = 7) -> str:
-    # Compatible with old server.go generatePassword(): no 0/O/1/l and no symbols.
+def _gen_compat_secret(length: int = 8) -> str:
+    # Conservative for WDTT clients: lowercase+digits only (no 0/1/l), no symbols.
     alphabet = _PASS_CHARS
     return "".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(length))
 
@@ -836,7 +836,10 @@ def wdtt_secret(payload: WDTTSecretReq, x_api_token: str | None = Header(default
     for sec, meta in pw.items():
         if isinstance(meta, dict) and int(meta.get("peer_id", 0) or 0) == int(payload.peer_id):
             return {"ok": True, "peer_id": payload.peer_id, "secret": sec, "reused": True}
-    secret = _gen_compat_secret(7)
+    # No secret-pool reuse: always issue a fresh unique secret.
+    secret = _gen_compat_secret(8)
+    while secret in pw:
+        secret = _gen_compat_secret(8)
     pw[secret] = {
         "device_id": "",
         "expires_at": 0,
@@ -879,7 +882,18 @@ def wdtt_secret_delete(payload: WDTTSecretDeleteReq, x_api_token: str | None = H
             break
     if not victim:
         return {"ok": True, "deleted": False}
-    pw.pop(victim, None)
+    # Never return deleted keys to reusable pool.
+    old = pw.get(victim, {}) if isinstance(pw.get(victim), dict) else {}
+    pw[victim] = {
+        "device_id": str(old.get("device_id", "")),
+        "expires_at": int(old.get("expires_at", 0) or 0),
+        "down_bytes": int(old.get("down_bytes", 0) or 0),
+        "up_bytes": int(old.get("up_bytes", 0) or 0),
+        "uid": 0,
+        "peer_id": -1,
+        "public_key": "",
+        "created_at": int(time.time()),
+    }
     data["passwords"] = pw
     _save_wdtt_secrets(data)
     return {"ok": True, "deleted": True}
@@ -936,7 +950,7 @@ CMD_TIMEOUT=12
 ALLOW_KEYPAIR_API=0
 WDTT_TURN_PORT=${WDTT_DTLS_PORT}
 VK_TURN_PORT=${VK_TURN_PORT}
-WDTT_SECRET_PATH=/etc/wireguard/wdtt/passwords.json
+WDTT_SECRET_PATH=/etc/wdtt/passwords.json
 EOF
     chmod 600 /etc/vpn-node-api.env
 
