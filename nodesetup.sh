@@ -498,6 +498,8 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=/usr/local/bin/wdtt-firewall.sh
 ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${WDTT_DTLS_PORT} -wg-port ${WDTT_WG_PORT} -config-dir ${wdtt_cfg_dir} -password "${WDTT_PASSWORD}"
+ExecReload=/bin/kill -HUP \$MAINPID
+KillMode=mixed
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -507,6 +509,7 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
+    systemctl unmask wdtt 2>/dev/null || true
     systemctl enable wdtt
     log_info "Сервис wdtt.service создан"
 }
@@ -702,6 +705,19 @@ def _save_wdtt_secrets(data: dict):
     tmp = WDTT_SECRET_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     tmp.replace(WDTT_SECRET_PATH)
+    # Отправляем SIGHUP серверу — он перечитает passwords.json без рестарта.
+    # Если новая серверная часть не запущена — тихо игнорируем.
+    _sighup_wdtt_server()
+
+def _sighup_wdtt_server():
+    """Отправляет SIGHUP основному процессу wdtt-server через systemd."""
+    try:
+        subprocess.run(
+            ["systemctl", "reload", "wdtt"],
+            capture_output=True, timeout=5
+        )
+    except Exception:
+        pass  # Сервис не запущен или ещё старая версия — не критично
 
 _PASS_CHARS = "abcdefghjkmnpqrstuvwxyz23456789"
 
@@ -713,12 +729,30 @@ def _gen_compat_secret(length: int = 8) -> str:
 @app.get("/health")
 def health(x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
+    try:
+        return _health_inner()
+    except Exception as e:
+        return {"ok": False, "error": str(e), "node": NODE_NAME, "mode": NODE_MODE,
+                "wg_interface_ok": False, "wg_service_ok": False,
+                "turn_service_ok": False, "wg_port_ok": False, "turn_port_ok": False}
+
+def _health_inner():
     wg_if = False
     try:
-        ifaces = _run(["wg", "show", "interfaces"])
-        xs = ifaces.split()
-        wg_if = ("wg0" in xs) or ("wdtt0" in xs)
-    except: pass
+        if NODE_MODE == "wdtt":
+            # wdtt-server — userspace WG, нет системного wg0.
+            # Живость: systemctl is-active ИЛИ процесс виден через pgrep.
+            wg_if = _svc_active("wdtt")
+            if not wg_if:
+                ps = subprocess.run(["pgrep", "-f", "wdtt-server"],
+                                    capture_output=True, timeout=3)
+                wg_if = ps.returncode == 0
+        else:
+            ifaces = subprocess.run(["wg", "show", "interfaces"],
+                                    capture_output=True, text=True, timeout=5)
+            wg_if = "wg0" in (ifaces.stdout or "")
+    except Exception:
+        pass
     out = ""
     try:
         out = _run(["bash", "-lc", "ss -ulnp 2>/dev/null; ss -tlnp 2>/dev/null"])
@@ -729,13 +763,19 @@ def health(x_api_token: str | None = Header(default=None)):
     vk_turn_ok   = bool(re.search(rf":{VK_TURN_PORT}\b", out))
     if NODE_MODE == "dual":
         turn_port_ok = wdtt_turn_ok and vk_turn_ok
+    wdtt_proc = wg_if if NODE_MODE == "wdtt" else False
+    turn_svc_ok = _svc_active("wdtt") if NODE_MODE in ("wdtt","dual") else _svc_active("vk-turn-proxy")
+    if NODE_MODE == "wdtt" and not turn_svc_ok:
+        # fallback: если systemd не видит сервис (masked/renamed) — проверяем процесс
+        ps2 = subprocess.run(["pgrep", "-f", "wdtt-server"], capture_output=True, timeout=3)
+        turn_svc_ok = ps2.returncode == 0
     return {
-        "ok": wg_if and turn_port_ok,
+        "ok": (wg_if or turn_svc_ok) if NODE_MODE == "wdtt" else (wg_if and turn_port_ok),
         "node": NODE_NAME,
         "mode": NODE_MODE,
         "wg_interface_ok": wg_if,
-        "wg_service_ok":   True,
-        "turn_service_ok": True,
+        "wg_service_ok":   _svc_active("wg-quick@wg0") if NODE_MODE != "wdtt" else True,
+        "turn_service_ok": turn_svc_ok,
         "wg_port_ok":      wg_port_ok,
         "turn_port_ok":    turn_port_ok,
         "wdtt_turn_port_ok": wdtt_turn_ok,
@@ -806,8 +846,15 @@ class PeerRemove(BaseModel):
 @app.post("/wg/peer/remove")
 async def wg_peer_remove(payload: PeerRemove, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
+    if NODE_MODE == "wdtt":
+        # wdtt: пиры живут в passwords.json, не в wg set
+        # Секрет удаляется отдельным вызовом /wdtt/secret/delete
+        return {"ok": True, "skipped": "wdtt_mode"}
     async with wg_lock:
-        _run(["wg", "set", _wg_iface(), "peer", payload.public_key, "remove"])
+        try:
+            _run(["wg", "set", _wg_iface(), "peer", payload.public_key, "remove"])
+        except Exception as e:
+            raise HTTPException(500, f"wg remove failed: {e}")
     return {"ok": True}
 
 class RestartReq(BaseModel):
@@ -826,6 +873,7 @@ class WDTTSecretReq(BaseModel):
     uid: int
     peer_id: int
     public_key: str = Field(min_length=44, max_length=44)
+    device_limit: int = Field(default=1, ge=1, le=16)
 
 @app.post("/wdtt/secret")
 def wdtt_secret(payload: WDTTSecretReq, x_api_token: str | None = Header(default=None)):
@@ -848,8 +896,19 @@ def wdtt_secret(payload: WDTTSecretReq, x_api_token: str | None = Header(default
         "uid": int(payload.uid),
         "peer_id": int(payload.peer_id),
         "public_key": payload.public_key,
+        "device_limit": int(payload.device_limit),
         "created_at": int(time.time()),
     }
+    # Track device_limit in separate devices dict
+    devs = data.get("devices", {})
+    if not isinstance(devs, dict):
+        devs = {}
+    devs[str(payload.peer_id)] = {
+        "limit": int(payload.device_limit),
+        "used": int(devs.get(str(payload.peer_id), {}).get("used", 0) or 0),
+        "updated_at": int(time.time()),
+    }
+    data["devices"] = devs
     data["passwords"] = pw
     _save_wdtt_secrets(data)
     return {"ok": True, "peer_id": payload.peer_id, "secret": secret, "reused": False}
@@ -882,20 +941,9 @@ def wdtt_secret_delete(payload: WDTTSecretDeleteReq, x_api_token: str | None = H
             break
     if not victim:
         return {"ok": True, "deleted": False}
-    # Never return deleted keys to reusable pool.
-    old = pw.get(victim, {}) if isinstance(pw.get(victim), dict) else {}
-    pw[victim] = {
-        "device_id": str(old.get("device_id", "")),
-        "expires_at": int(old.get("expires_at", 0) or 0),
-        "down_bytes": int(old.get("down_bytes", 0) or 0),
-        "up_bytes": int(old.get("up_bytes", 0) or 0),
-        "uid": 0,
-        "peer_id": -1,
-        "public_key": "",
-        "created_at": int(time.time()),
-    }
+    del pw[victim]
     data["passwords"] = pw
-    _save_wdtt_secrets(data)
+    _save_wdtt_secrets(data)  # включает SIGHUP — сервер перестанет принимать этот секрет
     return {"ok": True, "deleted": True}
 
 @app.get("/wdtt/stats")
@@ -914,6 +962,129 @@ def wdtt_stats(x_api_token: str | None = Header(default=None)):
             devices_n += 1
         total_bytes += int(meta.get("down_bytes", 0) or 0) + int(meta.get("up_bytes", 0) or 0)
     return {"ok": True, "secrets": secrets_n, "devices_bound": devices_n, "total_bytes": total_bytes}
+
+@app.post("/wdtt/reload")
+def wdtt_reload(x_api_token: str | None = Header(default=None)):
+    """
+    Отправляет SIGHUP процессу wdtt-server через systemctl reload.
+    Сервер перечитывает passwords.json (новые личные секреты, трафик)
+    без обрыва активных соединений.
+    Используется ботом после записи нового секрета.
+    """
+    _check_auth(x_api_token)
+    try:
+        proc = subprocess.run(
+            ["systemctl", "reload", "wdtt"],
+            capture_output=True, text=True, timeout=8
+        )
+        if proc.returncode == 0:
+            return {"ok": True, "signal": "SIGHUP"}
+        # reload не поддерживается (старый unit без ExecReload) — пробуем kill -HUP
+        pid_out = subprocess.run(
+            ["systemctl", "show", "-p", "MainPID", "wdtt"],
+            capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        pid = int(pid_out.split("=")[1]) if "=" in pid_out else 0
+        if pid > 1:
+            subprocess.run(["kill", "-HUP", str(pid)], timeout=5)
+            return {"ok": True, "signal": "SIGHUP", "method": "kill"}
+        raise HTTPException(500, f"wdtt reload failed: {proc.stderr.strip()[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"wdtt reload error: {str(e)[:200]}")
+
+# ─── Учёт трафика по личным секретам ────────────────────────────────────────
+# wdtt-server пишет down_bytes/up_bytes в passwords.json при SIGHUP.
+# Этот эндпоинт возвращает накопленный трафик для конкретного peer_id.
+
+class WDTTTrafficUpdateReq(BaseModel):
+    peer_id: int
+    down_bytes: int = 0
+    up_bytes:   int = 0
+
+@app.get("/wdtt/traffic/{peer_id}")
+def wdtt_traffic_get(peer_id: int, x_api_token: str | None = Header(default=None)):
+    """
+    Возвращает накопленный трафик (байты) для peer_id из passwords.json.
+    Данные обновляются сервером при каждом SIGHUP / reload.
+    """
+    _check_auth(x_api_token)
+    data = _load_wdtt_secrets()
+    for sec, meta in data.get("passwords", {}).items():
+        if not isinstance(meta, dict):
+            continue
+        if int(meta.get("peer_id", 0) or 0) == int(peer_id):
+            return {
+                "ok":         True,
+                "peer_id":    peer_id,
+                "secret":     sec,
+                "down_bytes": int(meta.get("down_bytes", 0) or 0),
+                "up_bytes":   int(meta.get("up_bytes",   0) or 0),
+                "total_bytes": int(meta.get("down_bytes", 0) or 0) + int(meta.get("up_bytes", 0) or 0),
+            }
+    raise HTTPException(404, "Secret not found for this peer_id")
+
+@app.post("/wdtt/traffic")
+def wdtt_traffic_update(payload: WDTTTrafficUpdateReq, x_api_token: str | None = Header(default=None)):
+    """
+    Обновляет счётчики трафика вручную (например, из внешнего коллектора).
+    При наличии SIGHUP-релоада эти данные перезапишутся сервером — 
+    используйте только если сервер сам не пишет трафик.
+    """
+    _check_auth(x_api_token)
+    data = _load_wdtt_secrets()
+    pw = data.get("passwords", {})
+    for sec, meta in pw.items():
+        if not isinstance(meta, dict):
+            continue
+        if int(meta.get("peer_id", 0) or 0) == int(payload.peer_id):
+            meta["down_bytes"] = int(payload.down_bytes)
+            meta["up_bytes"]   = int(payload.up_bytes)
+            data["passwords"]  = pw
+            _save_wdtt_secrets(data)  # включает SIGHUP
+            return {"ok": True, "peer_id": payload.peer_id,
+                    "down_bytes": payload.down_bytes, "up_bytes": payload.up_bytes}
+    raise HTTPException(404, "Secret not found for this peer_id")
+
+@app.get("/wdtt/public-key")
+def wdtt_public_key(x_api_token: str | None = Header(default=None)):
+    """
+    Возвращает публичный ключ wdtt-server из /etc/wdtt/wg-keys.dat (строка 2).
+    wg show wg0 не работает — wdtt использует userspace WG без системного интерфейса.
+    """
+    _check_auth(x_api_token)
+    keys_path = Path(os.getenv("WDTT_SECRET_PATH", "/etc/wdtt/passwords.json")).parent / "wg-keys.dat"
+    try:
+        lines = keys_path.read_text().strip().splitlines()
+        if len(lines) >= 2 and lines[1].strip():
+            return {"ok": True, "public_key": lines[1].strip()}
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        raise HTTPException(500, f"wg-keys.dat read error: {e}")
+    raise HTTPException(404, "wdtt public key not found (wg-keys.dat missing or empty)")
+
+@app.get("/wdtt/transfer")
+def wdtt_transfer(x_api_token: str | None = Header(default=None)):
+    """
+    Возвращает трафик по всем секретам сразу.
+    Формат: {"items": [{"secret": "...", "peer_id": N, "rx": N, "tx": N}]}
+    Аналог /wg/transfer но для wdtt — читает down_bytes/up_bytes из passwords.json.
+    """
+    _check_auth(x_api_token)
+    data = _load_wdtt_secrets()
+    items = []
+    for secret, meta in data.get("passwords", {}).items():
+        if not isinstance(meta, dict):
+            continue
+        items.append({
+            "secret":   secret,
+            "peer_id":  int(meta.get("peer_id", 0) or 0),
+            "rx":       int(meta.get("down_bytes", 0) or 0),
+            "tx":       int(meta.get("up_bytes",   0) or 0),
+        })
+    return {"ok": True, "items": items}
 
 @app.get("/wdtt/runtime-password")
 def wdtt_runtime_password(x_api_token: str | None = Header(default=None)):
@@ -1211,6 +1382,62 @@ detect_installed_mode() {
     echo "vk"
 }
 
+update_node_api() {
+    log_step "Бесшовное обновление Node API..."
+
+    # Читаем текущие параметры ноды
+    [[ -f /etc/vpn-node.env ]]     && source /etc/vpn-node.env
+    [[ -f /etc/vpn-node-api.env ]] && source /etc/vpn-node-api.env
+
+    if [[ ! -d /opt/vpn-node-api ]]; then
+        die "/opt/vpn-node-api не найден — выполните полную установку."
+    fi
+
+    # INSTALL_MODE берём из NODE_MODE текущего env
+    INSTALL_MODE="${NODE_MODE:-vk}"
+    # Восстанавливаем остальные переменные из env если не заданы
+    API_TOKEN="${VPN_NODE_API_TOKEN:-$API_TOKEN}"
+    NODE_NAME="${NODE_NAME:-node}"
+    VPN_SUBNET="${VPN_SUBNET:-10.200.0.0/16}"
+    wg_port="${WG_PORT:-51820}"
+    turn_port="${TURN_PORT:-56010}"
+    WDTT_DTLS_PORT="${WDTT_TURN_PORT:-56000}"
+    VK_TURN_PORT="${VK_TURN_PORT:-56010}"
+
+    log_info "Режим: $INSTALL_MODE  Нода: $NODE_NAME"
+
+    # 1. Перезаписываем wdtt.service (добавляет ExecReload если его не было)
+    if systemctl is-active --quiet wdtt || systemctl is-enabled --quiet wdtt 2>/dev/null; then
+        setup_wdtt_service
+        log_info "wdtt.service обновлён (ExecReload добавлен)."
+    fi
+
+    # 2. Обновляем app.py и vpn-node-api.env с правильным NODE_MODE
+    setup_node_api
+    # Гарантируем что NODE_MODE записан корректно
+    sed -i "s/^NODE_MODE=.*/NODE_MODE=${INSTALL_MODE}/" /etc/vpn-node-api.env
+    log_info "NODE_MODE=${INSTALL_MODE} записан в vpn-node-api.env"
+
+    # 3. Перезапускаем только Node API
+    systemctl restart vpn-node-api
+    sleep 2
+    if systemctl is-active --quiet vpn-node-api; then
+        log_info "Node API перезапущен успешно."
+    else
+        log_warn "Node API не запустился — смотрите journalctl -u vpn-node-api"
+        return 1
+    fi
+
+    # 4. SIGHUP для wdtt
+    if systemctl is-active --quiet wdtt; then
+        systemctl unmask wdtt 2>/dev/null || true
+        systemctl reload wdtt && log_info "WDTT получил SIGHUP." \
+            || log_warn "systemctl reload wdtt не удался."
+    fi
+
+    log_info "Обновление завершено. WG и WDTT не перезапускались."
+}
+
 upgrade_existing_node() {
     log_step "Обновление уже установленной ноды (без чистой переустановки)..."
 
@@ -1278,6 +1505,13 @@ main() {
     echo "=== VPN Node Setup v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"
 
     # Проверяем специальный режим обновления
+    if [[ "${1:-}" == "--update-api" ]]; then
+        detect_os
+        [[ -f /etc/vpn-node.env ]] && source /etc/vpn-node.env
+        update_node_api
+        return 0
+    fi
+
     if [[ "${1:-}" == "--upgrade-to-wdtt" ]]; then
         detect_os
         detect_firewall
