@@ -634,13 +634,15 @@ API_TOKEN   = os.getenv("VPN_NODE_API_TOKEN", "")
 WG_PORT     = int(os.getenv("WG_PORT", "$wg_port"))
 TURN_PORT   = int(os.getenv("TURN_PORT", "$turn_port"))
 NODE_NAME   = os.getenv("NODE_NAME", "node")
-NODE_MODE   = os.getenv("NODE_MODE", "$INSTALL_MODE")
+NODE_MODE   = str(os.getenv("NODE_MODE", "$INSTALL_MODE") or "$INSTALL_MODE").strip().lower()
 VPN_SUBNET  = os.getenv("VPN_SUBNET", "$VPN_SUBNET")
 CMD_TIMEOUT = int(os.getenv("CMD_TIMEOUT", "10"))
 ALLOW_KEYPAIR_API = os.getenv("ALLOW_KEYPAIR_API", "0") == "1"
 WDTT_TURN_PORT = int(os.getenv("WDTT_TURN_PORT", "$WDTT_DTLS_PORT"))
 VK_TURN_PORT   = int(os.getenv("VK_TURN_PORT", "$VK_TURN_PORT"))
 WDTT_SECRET_PATH = Path(os.getenv("WDTT_SECRET_PATH", "/etc/wdtt/passwords.json"))
+if NODE_MODE not in ("wdtt", "vk", "dual"):
+    NODE_MODE = "$INSTALL_MODE"
 
 app = FastAPI(title="vpn-node-api", version="2.0.0")
 wg_lock = asyncio.Lock()
@@ -675,6 +677,16 @@ def _wg_iface():
         return ifaces[0] if ifaces else "wg0"
     except Exception:
         return "wg0"
+
+def _svc_active(name: str) -> bool:
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", name],
+            capture_output=True, text=True, timeout=5
+        )
+        return proc.returncode == 0 and (proc.stdout or "").strip() == "active"
+    except Exception:
+        return False
 
 def _check_auth(token):
     if not API_TOKEN or token != API_TOKEN:
@@ -725,6 +737,38 @@ def _gen_compat_secret(length: int = 8) -> str:
     # Conservative for WDTT clients: lowercase+digits only (no 0/1/l), no symbols.
     alphabet = _PASS_CHARS
     return "".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(length))
+
+def _delete_wdtt_entries(data: dict, peer_id: int | None = None, public_key: str | None = None) -> int:
+    pw = data.get("passwords", {})
+    if not isinstance(pw, dict):
+        pw = {}
+    devs = data.get("devices", {})
+    if not isinstance(devs, dict):
+        devs = {}
+    victims = []
+    matched_peer_ids = set()
+    wanted_peer_id = int(peer_id) if peer_id is not None else None
+    wanted_pub = (public_key or "").strip()
+    for sec, meta in list(pw.items()):
+        if not isinstance(meta, dict):
+            continue
+        meta_peer_id = int(meta.get("peer_id", 0) or 0)
+        meta_pub = str(meta.get("public_key", "") or "").strip()
+        by_peer_id = wanted_peer_id is not None and meta_peer_id == wanted_peer_id
+        by_public_key = bool(wanted_pub) and meta_pub == wanted_pub
+        if by_peer_id or by_public_key:
+            victims.append(sec)
+            if meta_peer_id > 0:
+                matched_peer_ids.add(str(meta_peer_id))
+    for sec in victims:
+        pw.pop(sec, None)
+    if wanted_peer_id is not None:
+        matched_peer_ids.add(str(wanted_peer_id))
+    for pid in matched_peer_ids:
+        devs.pop(pid, None)
+    data["passwords"] = pw
+    data["devices"] = devs
+    return len(victims)
 
 @app.get("/health")
 def health(x_api_token: str | None = Header(default=None)):
@@ -847,9 +891,11 @@ class PeerRemove(BaseModel):
 async def wg_peer_remove(payload: PeerRemove, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     if NODE_MODE == "wdtt":
-        # wdtt: пиры живут в passwords.json, не в wg set
-        # Секрет удаляется отдельным вызовом /wdtt/secret/delete
-        return {"ok": True, "skipped": "wdtt_mode"}
+        data = _load_wdtt_secrets()
+        deleted = _delete_wdtt_entries(data, public_key=payload.public_key)
+        if deleted > 0:
+            _save_wdtt_secrets(data)
+        return {"ok": True, "deleted": bool(deleted), "deleted_count": deleted}
     async with wg_lock:
         try:
             _run(["wg", "set", _wg_iface(), "peer", payload.public_key, "remove"])
@@ -933,18 +979,11 @@ class WDTTSecretDeleteReq(BaseModel):
 def wdtt_secret_delete(payload: WDTTSecretDeleteReq, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     data = _load_wdtt_secrets()
-    pw = data.get("passwords", {})
-    victim = None
-    for sec, meta in pw.items():
-        if isinstance(meta, dict) and int(meta.get("peer_id", 0) or 0) == int(payload.peer_id):
-            victim = sec
-            break
-    if not victim:
+    deleted = _delete_wdtt_entries(data, peer_id=payload.peer_id)
+    if deleted <= 0:
         return {"ok": True, "deleted": False}
-    del pw[victim]
-    data["passwords"] = pw
     _save_wdtt_secrets(data)  # включает SIGHUP — сервер перестанет принимать этот секрет
-    return {"ok": True, "deleted": True}
+    return {"ok": True, "deleted": True, "deleted_count": deleted}
 
 @app.get("/wdtt/stats")
 def wdtt_stats(x_api_token: str | None = Header(default=None)):
