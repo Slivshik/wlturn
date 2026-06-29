@@ -640,7 +640,12 @@ CMD_TIMEOUT = int(os.getenv("CMD_TIMEOUT", "10"))
 ALLOW_KEYPAIR_API = os.getenv("ALLOW_KEYPAIR_API", "0") == "1"
 WDTT_TURN_PORT = int(os.getenv("WDTT_TURN_PORT", "$WDTT_DTLS_PORT"))
 VK_TURN_PORT   = int(os.getenv("VK_TURN_PORT", "$VK_TURN_PORT"))
-WDTT_SECRET_PATH = Path(os.getenv("WDTT_SECRET_PATH", "/etc/wdtt/passwords.json"))
+_WDTT_SECRET_DEFAULT = str(os.getenv("WDTT_SECRET_PATH", "/etc/wdtt/passwords.json")).strip() or "/etc/wdtt/passwords.json"
+_WDTT_SECRET_CANDIDATES = [
+    Path(_WDTT_SECRET_DEFAULT),
+    Path("/etc/wdtt/passwords.json"),
+    Path("/etc/wireguard/wdtt/passwords.json"),
+]
 if NODE_MODE not in ("wdtt", "vk", "dual"):
     NODE_MODE = "$INSTALL_MODE"
 
@@ -692,11 +697,28 @@ def _check_auth(token):
     if not API_TOKEN or token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-def _load_wdtt_secrets():
+def _iter_wdtt_secret_paths() -> list[Path]:
+    seen = set()
+    paths = []
+    for path in _WDTT_SECRET_CANDIDATES:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path.exists():
+            paths.append(path)
+    if paths:
+        return paths
+    return [Path(_WDTT_SECRET_DEFAULT)]
+
+def _wdtt_secret_path() -> Path:
+    return _iter_wdtt_secret_paths()[0]
+
+def _load_wdtt_secrets_from(path: Path):
     try:
-        if not WDTT_SECRET_PATH.exists():
+        if not path.exists():
             return {"main_password": "", "admin_id": "", "bot_token": "", "passwords": {}, "devices": {}}
-        data = json.loads(WDTT_SECRET_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             data = {}
         data.setdefault("main_password", "")
@@ -712,14 +734,20 @@ def _load_wdtt_secrets():
     except Exception:
         return {"main_password": "", "admin_id": "", "bot_token": "", "passwords": {}, "devices": {}}
 
-def _save_wdtt_secrets(data: dict):
-    WDTT_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = WDTT_SECRET_PATH.with_suffix(".tmp")
+def _load_wdtt_secrets():
+    return _load_wdtt_secrets_from(_wdtt_secret_path())
+
+def _save_wdtt_secrets_to(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    tmp.replace(WDTT_SECRET_PATH)
+    tmp.replace(path)
     # Отправляем SIGHUP серверу — он перечитает passwords.json без рестарта.
     # Если новая серверная часть не запущена — тихо игнорируем.
     _sighup_wdtt_server()
+
+def _save_wdtt_secrets(data: dict):
+    _save_wdtt_secrets_to(_wdtt_secret_path(), data)
 
 def _sighup_wdtt_server():
     """Отправляет SIGHUP основному процессу wdtt-server через systemd."""
@@ -738,7 +766,7 @@ def _gen_compat_secret(length: int = 8) -> str:
     alphabet = _PASS_CHARS
     return "".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(length))
 
-def _delete_wdtt_entries(data: dict, peer_id: int | None = None, public_key: str | None = None) -> int:
+def _delete_wdtt_entries(data: dict, peer_id: int | None = None, public_key: str | None = None, secret: str | None = None) -> int:
     pw = data.get("passwords", {})
     if not isinstance(pw, dict):
         pw = {}
@@ -749,14 +777,16 @@ def _delete_wdtt_entries(data: dict, peer_id: int | None = None, public_key: str
     matched_peer_ids = set()
     wanted_peer_id = int(peer_id) if peer_id is not None else None
     wanted_pub = (public_key or "").strip()
+    wanted_secret = (secret or "").strip()
     for sec, meta in list(pw.items()):
         if not isinstance(meta, dict):
             continue
         meta_peer_id = int(meta.get("peer_id", 0) or 0)
         meta_pub = str(meta.get("public_key", "") or "").strip()
+        by_secret = bool(wanted_secret) and sec == wanted_secret
         by_peer_id = wanted_peer_id is not None and meta_peer_id == wanted_peer_id
         by_public_key = bool(wanted_pub) and meta_pub == wanted_pub
-        if by_peer_id or by_public_key:
+        if by_secret or by_peer_id or by_public_key:
             victims.append(sec)
             if meta_peer_id > 0:
                 matched_peer_ids.add(str(meta_peer_id))
@@ -769,6 +799,16 @@ def _delete_wdtt_entries(data: dict, peer_id: int | None = None, public_key: str
     data["passwords"] = pw
     data["devices"] = devs
     return len(victims)
+
+def _delete_wdtt_entries_all(peer_id: int | None = None, public_key: str | None = None, secret: str | None = None) -> int:
+    deleted_total = 0
+    for path in _iter_wdtt_secret_paths():
+        data = _load_wdtt_secrets_from(path)
+        deleted = _delete_wdtt_entries(data, peer_id=peer_id, public_key=public_key, secret=secret)
+        if deleted > 0:
+            _save_wdtt_secrets_to(path, data)
+            deleted_total += deleted
+    return deleted_total
 
 @app.get("/health")
 def health(x_api_token: str | None = Header(default=None)):
@@ -891,10 +931,7 @@ class PeerRemove(BaseModel):
 async def wg_peer_remove(payload: PeerRemove, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
     if NODE_MODE == "wdtt":
-        data = _load_wdtt_secrets()
-        deleted = _delete_wdtt_entries(data, public_key=payload.public_key)
-        if deleted > 0:
-            _save_wdtt_secrets(data)
+        deleted = _delete_wdtt_entries_all(public_key=payload.public_key)
         return {"ok": True, "deleted": bool(deleted), "deleted_count": deleted}
     async with wg_lock:
         try:
@@ -973,16 +1010,21 @@ def wdtt_secret_get(peer_id: int, x_api_token: str | None = Header(default=None)
     raise HTTPException(404, "Secret not found")
 
 class WDTTSecretDeleteReq(BaseModel):
-    peer_id: int
+    peer_id: int | None = None
+    public_key: str = ""
+    secret: str = ""
 
 @app.post("/wdtt/secret/delete")
 def wdtt_secret_delete(payload: WDTTSecretDeleteReq, x_api_token: str | None = Header(default=None)):
     _check_auth(x_api_token)
-    data = _load_wdtt_secrets()
-    deleted = _delete_wdtt_entries(data, peer_id=payload.peer_id)
+    wanted_peer_id = int(payload.peer_id) if payload.peer_id is not None else None
+    wanted_pub = (payload.public_key or "").strip()
+    wanted_secret = (payload.secret or "").strip()
+    if wanted_peer_id is None and not wanted_pub and not wanted_secret:
+        raise HTTPException(400, "peer_id, public_key or secret required")
+    deleted = _delete_wdtt_entries_all(peer_id=wanted_peer_id, public_key=wanted_pub, secret=wanted_secret)
     if deleted <= 0:
         return {"ok": True, "deleted": False}
-    _save_wdtt_secrets(data)  # включает SIGHUP — сервер перестанет принимать этот секрет
     return {"ok": True, "deleted": True, "deleted_count": deleted}
 
 @app.get("/wdtt/stats")
@@ -1093,7 +1135,7 @@ def wdtt_public_key(x_api_token: str | None = Header(default=None)):
     wg show wg0 не работает — wdtt использует userspace WG без системного интерфейса.
     """
     _check_auth(x_api_token)
-    keys_path = Path(os.getenv("WDTT_SECRET_PATH", "/etc/wdtt/passwords.json")).parent / "wg-keys.dat"
+    keys_path = _wdtt_secret_path().parent / "wg-keys.dat"
     try:
         lines = keys_path.read_text().strip().splitlines()
         if len(lines) >= 2 and lines[1].strip():
